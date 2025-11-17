@@ -27,9 +27,7 @@ struct HomeView: View {
             Spacer()
             
             // Continue Button
-            Button(action: {
-                // Placeholder action
-            }) {
+            NavigationLink(destination: BlinkDetectionView()) {
                 Text("Continue")
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundColor(.white)

@@ -111,6 +111,111 @@ class NetworkManager {
         }.resume()
     }
     
+    /// Start a blink detection session on the server
+    /// - Parameter completion: Callback with success status and message
+    func startSession(completion: @escaping (Bool, String) -> Void) {
+        guard let url = URL(string: "\(baseURL)/start_session") else {
+            completion(false, "Invalid server URL")
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "{}".data(using: .utf8)  // Empty JSON body
+        request.timeoutInterval = 5.0
+        
+        print("NetworkManager: Starting session")
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    print("NetworkManager: Start session error: \(error.localizedDescription)")
+                    completion(false, "Network error: \(error.localizedDescription)")
+                    return
+                }
+                
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    print("NetworkManager: Invalid response type")
+                    completion(false, "Invalid response")
+                    return
+                }
+                
+                print("NetworkManager: Start session response status: \(httpResponse.statusCode)")
+                guard httpResponse.statusCode == 200 else {
+                    print("NetworkManager: Server returned error: HTTP \(httpResponse.statusCode)")
+                    completion(false, "Server error: HTTP \(httpResponse.statusCode)")
+                    return
+                }
+                
+                if let data = data,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let status = json["status"] as? String {
+                    if status == "success" {
+                        let message = json["message"] as? String ?? "Session started"
+                        print("NetworkManager: Session started successfully")
+                        completion(true, message)
+                    } else {
+                        let message = json["message"] as? String ?? "Unknown error"
+                        completion(false, message)
+                    }
+                } else {
+                    completion(false, "Failed to parse server response")
+                }
+            }
+        }.resume()
+    }
+    
+    /// End the blink detection session and get final results
+    /// - Parameter completion: Callback with success status, total blinks, and session duration
+    func endSession(completion: @escaping (Bool, Int?, Double?) -> Void) {
+        guard let url = URL(string: "\(baseURL)/end_session") else {
+            completion(false, nil, nil)
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = "{}".data(using: .utf8)  // Empty JSON body
+        request.timeoutInterval = 5.0
+        
+        print("NetworkManager: Ending session")
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    print("NetworkManager: End session error: \(error.localizedDescription)")
+                    completion(false, nil, nil)
+                    return
+                }
+                
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    print("NetworkManager: Invalid response type")
+                    completion(false, nil, nil)
+                    return
+                }
+                
+                print("NetworkManager: End session response status: \(httpResponse.statusCode)")
+                guard httpResponse.statusCode == 200 else {
+                    print("NetworkManager: Server returned error: HTTP \(httpResponse.statusCode)")
+                    completion(false, nil, nil)
+                    return
+                }
+                
+                if let data = data,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let status = json["status"] as? String,
+                   status == "success" {
+                    let totalBlinks = json["total_blinks"] as? Int
+                    let sessionDuration = json["session_duration"] as? Double
+                    print("NetworkManager: Session ended. Total blinks: \(totalBlinks ?? 0), Duration: \(sessionDuration ?? 0)s")
+                    completion(true, totalBlinks, sessionDuration)
+                } else {
+                    completion(false, nil, nil)
+                }
+            }
+        }.resume()
+    }
+    
     /// Check if server is reachable
     /// - Parameter completion: Callback with connection status
     func checkServerConnection(completion: @escaping (Bool, String) -> Void) {

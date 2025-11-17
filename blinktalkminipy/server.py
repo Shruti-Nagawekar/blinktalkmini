@@ -366,6 +366,58 @@ class EARCalculator:
 
 class FrameHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
+        """Handle POST requests - session management or frame data"""
+        # Handle session management endpoints
+        if self.path == '/start_session':
+            # Start a new blink detection session
+            blink_state['session_active'] = True
+            blink_state['blink_count'] = 0
+            blink_state['was_closed'] = False
+            blink_state['session_start_time'] = datetime.now()
+            
+            response = {
+                'status': 'success',
+                'message': 'Session started',
+                'session_start_time': blink_state['session_start_time'].isoformat()
+            }
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            print(f"Session started at {blink_state['session_start_time'].isoformat()}")
+            return
+            
+        elif self.path == '/end_session':
+            # End session and return final blink count
+            session_duration = None
+            if blink_state['session_start_time']:
+                duration = datetime.now() - blink_state['session_start_time']
+                session_duration = duration.total_seconds()
+            
+            total_blinks = blink_state['blink_count']
+            blink_state['session_active'] = False
+            blink_state['was_closed'] = False
+            
+            response = {
+                'status': 'success',
+                'total_blinks': total_blinks,
+                'session_duration': session_duration
+            }
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            print(f"Session ended. Total blinks: {total_blinks}, Duration: {session_duration:.2f}s" if session_duration else f"Session ended. Total blinks: {total_blinks}")
+            return
+        
+        # Regular frame POST request
+        self.handle_frame_post()
+    
+    def handle_frame_post(self):
         """Handle POST requests with frame data from camera stream"""
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)

@@ -11,7 +11,7 @@ import SwiftUI
 struct blinktalkminiswiftApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            HomeView()
         }
     }
 }

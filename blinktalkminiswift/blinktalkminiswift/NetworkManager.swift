@@ -64,21 +64,32 @@ class NetworkManager {
         request.timeoutInterval = 5.0  // Shorter timeout for streaming
         
         // Send request (fire-and-forget for streaming, or with completion)
+        print("NetworkManager: Sending POST request to \(url.absoluteString)")
         URLSession.shared.dataTask(with: request) { data, response, error in
-            guard let completion = completion else { return }  // Fire-and-forget if no completion
+            guard let completion = completion else {
+                // Fire-and-forget - log if there's an error
+                if let error = error {
+                    print("NetworkManager: Fire-and-forget request failed: \(error.localizedDescription)")
+                }
+                return
+            }
             
             DispatchQueue.main.async {
                 if let error = error {
+                    print("NetworkManager: Request error: \(error.localizedDescription)")
                     completion(false, "Network error: \(error.localizedDescription)")
                     return
                 }
                 
                 guard let httpResponse = response as? HTTPURLResponse else {
+                    print("NetworkManager: Invalid response type")
                     completion(false, "Invalid response")
                     return
                 }
                 
+                print("NetworkManager: Response status code: \(httpResponse.statusCode)")
                 guard httpResponse.statusCode == 200 else {
+                    print("NetworkManager: Server returned error: HTTP \(httpResponse.statusCode)")
                     completion(false, "Server error: HTTP \(httpResponse.statusCode)")
                     return
                 }

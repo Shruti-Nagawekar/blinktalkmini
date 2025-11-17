@@ -15,6 +15,8 @@ from pathlib import Path
 from collections import deque
 import cv2
 import numpy as np
+import dlib
+import urllib.request
 
 # Server configuration
 MAC_IP = "100.70.127.109"
@@ -29,6 +31,19 @@ frame_stats = {
     'total_errors': 0,
     'last_frame_time': None
 }
+
+# Blink detection state (per session)
+blink_state = {
+    'was_closed': False,  # Previous frame EAR state (True if EAR ≤ threshold)
+    'blink_count': 0,     # Total blinks in current session
+    'session_active': False,  # Whether a session is active
+    'session_start_time': None
+}
+
+# EAR threshold for blink detection
+# Based on observed values: closed ~0.33, open ~0.46
+# Using 0.35 as threshold (adjust if needed)
+EAR_BLINK_THRESHOLD = 0.35
 
 # Optional: Keep last N frames in memory for processing
 frame_buffer = deque(maxlen=10)
@@ -70,19 +85,59 @@ if cascade_path is None:
     # Fallback: download or use alternative detection method
     print("Warning: Haar cascade files not found. Face detection may not work.")
     face_detector = None
-    eye_detector = None
 else:
     face_detector = cv2.CascadeClassifier(os.path.join(cascade_path, 'haarcascade_frontalface_default.xml'))
-    eye_detector = cv2.CascadeClassifier(os.path.join(cascade_path, 'haarcascade_eye.xml'))
     print(f"Face detector initialized from: {cascade_path}")
 
+# Initialize dlib facial landmark predictor
+# Download shape predictor if not present
+SHAPE_PREDICTOR_URL = "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+# Use absolute path relative to script location
+SCRIPT_DIR = Path(__file__).parent.absolute()
+SHAPE_PREDICTOR_PATH = SCRIPT_DIR / "shape_predictor_68_face_landmarks.dat"
+SHAPE_PREDICTOR_COMPRESSED = SCRIPT_DIR / "shape_predictor_68_face_landmarks.dat.bz2"
+
+landmark_predictor = None
+dlib_face_detector = None
+
+try:
+    # Check if shape predictor exists
+    if not SHAPE_PREDICTOR_PATH.exists():
+        print("Downloading dlib shape predictor (68-point facial landmark model)...")
+        print("This is a one-time download (~100MB). Please wait...")
+        
+        # Download compressed file
+        urllib.request.urlretrieve(SHAPE_PREDICTOR_URL, SHAPE_PREDICTOR_COMPRESSED)
+        
+        # Decompress (bz2)
+        import bz2
+        with bz2.open(SHAPE_PREDICTOR_COMPRESSED, 'rb') as f_in:
+            with open(SHAPE_PREDICTOR_PATH, 'wb') as f_out:
+                f_out.write(f_in.read())
+        
+        # Remove compressed file
+        SHAPE_PREDICTOR_COMPRESSED.unlink()
+        print("Shape predictor downloaded and extracted successfully.")
+    
+    # Initialize dlib components
+    landmark_predictor = dlib.shape_predictor(str(SHAPE_PREDICTOR_PATH))
+    dlib_face_detector = dlib.get_frontal_face_detector()
+    print("dlib facial landmark detector initialized successfully.")
+    
+except Exception as e:
+    print(f"Warning: Failed to initialize dlib: {e}")
+    print("Falling back to OpenCV Haar Cascade eye detection.")
+    landmark_predictor = None
+    dlib_face_detector = None
+
 class FaceLandmarkDetector:
-    """Detects facial landmarks and extracts eye coordinates using OpenCV"""
+    """Detects facial landmarks and extracts eye coordinates using dlib"""
+    _last_log_frame = 0
     
     @staticmethod
     def detect_landmarks(image_data):
         """
-        Detect facial landmarks from image data using OpenCV
+        Detect facial landmarks from image data using dlib
         Returns: landmarks dict with eye coordinates or None if no face detected
         """
         try:
@@ -97,91 +152,217 @@ class FaceLandmarkDetector:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             height, width = gray.shape
             
-            # Detect faces
+            # Use OpenCV for face detection, then dlib for landmarks (hybrid approach)
+            # This combines OpenCV's reliable face detection with dlib's accurate landmarks
+            if face_detector is not None and landmark_predictor is not None:
+                # Detect faces using OpenCV (more reliable)
+                faces = face_detector.detectMultiScale(gray, 1.1, 4, minSize=(50, 50))
+                
+                if len(faces) == 0:
+                    # Log occasionally to debug
+                    if FaceLandmarkDetector._last_log_frame < frame_stats.get('total_received', 0):
+                        FaceLandmarkDetector._last_log_frame = frame_stats.get('total_received', 0) + 50
+                        print(f"FaceLandmarkDetector: OpenCV detected 0 faces (dlib path)")
+                    return None
+                
+                # Use first detected face
+                (x, y, w, h) = faces[0]
+                
+                # Convert OpenCV rectangle to dlib rectangle format
+                # dlib uses (left, top, right, bottom) format
+                try:
+                    dlib_rect = dlib.rectangle(int(x), int(y), int(x + w), int(y + h))
+                    
+                    # Ensure gray is contiguous for dlib
+                    if not gray.flags['C_CONTIGUOUS']:
+                        gray = np.ascontiguousarray(gray)
+                    
+                    # Get facial landmarks (68 points) using dlib
+                    landmarks = landmark_predictor(gray, dlib_rect)
+                    
+                    # Extract eye landmarks from 68-point model
+                    # Left eye: points 36-41 (0-indexed: 36, 37, 38, 39, 40, 41)
+                    # Right eye: points 42-47 (0-indexed: 42, 43, 44, 45, 46, 47)
+                    # For EAR calculation, we need 6 points per eye:
+                    # [outer_corner, inner_corner, top1, bottom1, top2, bottom2]
+                    
+                    # Left eye points (36-41)
+                    # 36 = outer corner, 39 = inner corner
+                    # 37 = top1, 41 = bottom1, 38 = top2, 40 = bottom2
+                    left_eye_points = np.array([
+                        [landmarks.part(36).x, landmarks.part(36).y],  # outer corner
+                        [landmarks.part(39).x, landmarks.part(39).y],  # inner corner
+                        [landmarks.part(37).x, landmarks.part(37).y],  # top1
+                        [landmarks.part(41).x, landmarks.part(41).y],  # bottom1
+                        [landmarks.part(38).x, landmarks.part(38).y],  # top2
+                        [landmarks.part(40).x, landmarks.part(40).y],  # bottom2
+                    ])
+                    
+                    # Right eye points (42-47)
+                    # 42 = inner corner, 45 = outer corner
+                    # 43 = top1, 47 = bottom1, 44 = top2, 46 = bottom2
+                    right_eye_points = np.array([
+                        [landmarks.part(45).x, landmarks.part(45).y],  # outer corner
+                        [landmarks.part(42).x, landmarks.part(42).y],  # inner corner
+                        [landmarks.part(43).x, landmarks.part(43).y],  # top1
+                        [landmarks.part(47).x, landmarks.part(47).y],  # bottom1
+                        [landmarks.part(44).x, landmarks.part(44).y],  # top2
+                        [landmarks.part(46).x, landmarks.part(46).y],  # bottom2
+                    ])
+                    
+                    return {
+                        'left_eye': left_eye_points,
+                        'right_eye': right_eye_points,
+                        'face_detected': True,
+                        'eyes_detected': True  # dlib always provides eye landmarks
+                    }
+                except Exception as e:
+                    # If dlib fails, fall through to OpenCV fallback
+                    print(f"FaceLandmarkDetector: dlib landmark prediction/extraction failed: {e}")
+                    # Fall through to OpenCV fallback below
+            
+            # Fallback to OpenCV if dlib not available
             if face_detector is None:
+                if FaceLandmarkDetector._last_log_frame < frame_stats.get('total_received', 0):
+                    FaceLandmarkDetector._last_log_frame = frame_stats.get('total_received', 0) + 50
+                    print(f"FaceLandmarkDetector: face_detector is None, cannot detect faces")
                 return None
+            
+            # Check if we're in fallback mode (dlib not available)
+            if landmark_predictor is None:
+                if FaceLandmarkDetector._last_log_frame < frame_stats.get('total_received', 0):
+                    FaceLandmarkDetector._last_log_frame = frame_stats.get('total_received', 0) + 50
+                    print(f"FaceLandmarkDetector: Using OpenCV fallback (dlib not available)")
+            
             faces = face_detector.detectMultiScale(gray, 1.1, 4, minSize=(50, 50))
             
             if len(faces) == 0:
+                # Log occasionally to debug
+                if FaceLandmarkDetector._last_log_frame < frame_stats.get('total_received', 0):
+                    FaceLandmarkDetector._last_log_frame = frame_stats.get('total_received', 0) + 50
+                    print(f"FaceLandmarkDetector: OpenCV detected 0 faces (fallback path)")
                 return None
             
             # Use first detected face
             (x, y, w, h) = faces[0]
-            face_roi = gray[y:y+h, x:x+w]
             
-            # Detect eyes within face region
-            if eye_detector is None:
-                eyes = []
-            else:
-                eyes = eye_detector.detectMultiScale(face_roi, 1.1, 3)
+            # Estimate eye positions based on face proportions (fallback)
+            left_eye_center_x = x + w * 0.25
+            right_eye_center_x = x + w * 0.75
+            eye_y = y + h * 0.35
+            eye_width = w * 0.20
+            eye_height = h * 0.125
             
-            if len(eyes) < 2:
-                # If eyes not detected, estimate eye positions based on face proportions
-                # Standard face proportions: eyes are at ~1/3 from top, ~1/4 from sides
-                left_eye_center_x = x + w * 0.25
-                right_eye_center_x = x + w * 0.75
-                eye_y = y + h * 0.35
-                eye_width = w * 0.15
-                eye_height = h * 0.15
-                
-                # Create 6 points for each eye (for EAR calculation)
-                # Points: [outer_corner, inner_corner, top1, bottom1, top2, bottom2]
-                left_eye_points = np.array([
-                    [left_eye_center_x - eye_width/2, eye_y],  # outer corner
-                    [left_eye_center_x + eye_width/2, eye_y],  # inner corner
-                    [left_eye_center_x - eye_width/4, eye_y - eye_height/2],  # top1
-                    [left_eye_center_x - eye_width/4, eye_y + eye_height/2],  # bottom1
-                    [left_eye_center_x + eye_width/4, eye_y - eye_height/2],  # top2
-                    [left_eye_center_x + eye_width/4, eye_y + eye_height/2],  # bottom2
-                ])
-                
-                right_eye_points = np.array([
-                    [right_eye_center_x - eye_width/2, eye_y],  # inner corner
-                    [right_eye_center_x + eye_width/2, eye_y],  # outer corner
-                    [right_eye_center_x - eye_width/4, eye_y - eye_height/2],  # top1
-                    [right_eye_center_x - eye_width/4, eye_y + eye_height/2],  # bottom1
-                    [right_eye_center_x + eye_width/4, eye_y - eye_height/2],  # top2
-                    [right_eye_center_x + eye_width/4, eye_y + eye_height/2],  # bottom2
-                ])
-            else:
-                # Sort eyes by x-coordinate (left eye first)
-                eyes = sorted(eyes, key=lambda e: e[0])
-                left_eye, right_eye = eyes[0], eyes[1]
-                
-                # Extract 6 points for each eye
-                # Convert relative to face coordinates to absolute image coordinates
-                lx, ly, lw, lh = left_eye
-                rx, ry, rw, rh = right_eye
-                
-                # Left eye points
-                left_eye_points = np.array([
-                    [x + lx, y + ly + lh/2],  # outer corner
-                    [x + lx + lw, y + ly + lh/2],  # inner corner
-                    [x + lx + lw/4, y + ly],  # top1
-                    [x + lx + lw/4, y + ly + lh],  # bottom1
-                    [x + lx + 3*lw/4, y + ly],  # top2
-                    [x + lx + 3*lw/4, y + ly + lh],  # bottom2
-                ])
-                
-                # Right eye points
-                right_eye_points = np.array([
-                    [x + rx, y + ry + rh/2],  # inner corner
-                    [x + rx + rw, y + ry + rh/2],  # outer corner
-                    [x + rx + rw/4, y + ry],  # top1
-                    [x + rx + rw/4, y + ry + rh],  # bottom1
-                    [x + rx + 3*rw/4, y + ry],  # top2
-                    [x + rx + 3*rw/4, y + ry + rh],  # bottom2
-                ])
+            # Create 6 points for each eye (for EAR calculation)
+            left_eye_points = np.array([
+                [left_eye_center_x - eye_width/2, eye_y],  # outer corner
+                [left_eye_center_x + eye_width/2, eye_y],  # inner corner
+                [left_eye_center_x - eye_width/4, eye_y - eye_height/2],  # top1
+                [left_eye_center_x - eye_width/4, eye_y + eye_height/2],  # bottom1
+                [left_eye_center_x + eye_width/4, eye_y - eye_height/2],  # top2
+                [left_eye_center_x + eye_width/4, eye_y + eye_height/2],  # bottom2
+            ])
+            
+            right_eye_points = np.array([
+                [right_eye_center_x - eye_width/2, eye_y],  # inner corner
+                [right_eye_center_x + eye_width/2, eye_y],  # outer corner
+                [right_eye_center_x - eye_width/4, eye_y - eye_height/2],  # top1
+                [right_eye_center_x - eye_width/4, eye_y + eye_height/2],  # bottom1
+                [right_eye_center_x + eye_width/4, eye_y - eye_height/2],  # top2
+                [right_eye_center_x + eye_width/4, eye_y + eye_height/2],  # bottom2
+            ])
             
             return {
                 'left_eye': left_eye_points,
                 'right_eye': right_eye_points,
-                'face_detected': True
+                'face_detected': True,
+                'eyes_detected': False  # Using estimated positions
             }
             
         except Exception as e:
             print(f"FaceLandmarkDetector: Error detecting landmarks: {e}")
             return None
+
+class EARCalculator:
+    """Calculates Eye Aspect Ratio (EAR) from eye landmark points"""
+    
+    @staticmethod
+    def calculate_ear(eye_points):
+        """
+        Calculate EAR for a single eye
+        Formula: EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+        Where:
+        - p1, p4: horizontal eye corners (outer, inner)
+        - p2, p3: vertical points on top eyelid
+        - p5, p6: vertical points on bottom eyelid
+        
+        Args:
+            eye_points: numpy array of 6 points [p1, p4, p2, p5, p3, p6]
+        
+        Returns:
+            EAR value (float) or None if calculation fails
+        """
+        if eye_points is None or len(eye_points) < 6:
+            return None
+        
+        try:
+            # Extract points
+            p1 = eye_points[0]  # outer corner
+            p4 = eye_points[1]  # inner corner
+            p2 = eye_points[2]  # top1
+            p5 = eye_points[3]  # bottom1
+            p3 = eye_points[4]  # top2
+            p6 = eye_points[5]  # bottom2
+            
+            # Calculate Euclidean distances
+            # Vertical distances (top eyelid to bottom eyelid)
+            # Formula: EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
+            vertical1 = np.linalg.norm(p2 - p6)  # |p2-p6| (top1 to bottom2)
+            vertical2 = np.linalg.norm(p3 - p5)  # |p3-p5| (top2 to bottom1)
+            
+            # Horizontal distance (corner to corner)
+            horizontal = np.linalg.norm(p1 - p4)  # |p1-p4|
+            
+            # Avoid division by zero
+            if horizontal == 0:
+                return None
+            
+            # Calculate EAR
+            ear = (vertical1 + vertical2) / (2.0 * horizontal)
+            return ear
+            
+        except Exception as e:
+            print(f"EARCalculator: Error calculating EAR: {e}")
+            return None
+    
+    @staticmethod
+    def calculate_average_ear(landmarks):
+        """
+        Calculate average EAR from both eyes
+        
+        Args:
+            landmarks: dict with 'left_eye' and 'right_eye' arrays
+        
+        Returns:
+            Average EAR value (float) or None if calculation fails
+        """
+        if landmarks is None:
+            return None
+        
+        left_ear = EARCalculator.calculate_ear(landmarks.get('left_eye'))
+        right_ear = EARCalculator.calculate_ear(landmarks.get('right_eye'))
+        
+        # If both eyes calculated successfully, return average
+        if left_ear is not None and right_ear is not None:
+            return (left_ear + right_ear) / 2.0
+        
+        # If only one eye calculated, return that value
+        if left_ear is not None:
+            return left_ear
+        if right_ear is not None:
+            return right_ear
+        
+        return None
 
 class FrameHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
@@ -219,26 +400,71 @@ class FrameHandler(http.server.SimpleHTTPRequestHandler):
                 }
                 frame_buffer.append(frame_info)
                 
-                # Detect facial landmarks
+                # Detect facial landmarks and calculate EAR
                 try:
                     landmarks = FaceLandmarkDetector.detect_landmarks(image_data)
                     face_detected = landmarks is not None
+                    ear_value = None
                     
-                    # Log face detection results (every 10 frames to see results more frequently)
+                    if landmarks:
+                        # Calculate EAR value
+                        ear_value = EARCalculator.calculate_average_ear(landmarks)
+                        
+                        # Blink detection only when session is active
+                        if ear_value is not None and blink_state['session_active']:
+                            # Blink detection: count when EAR transitions from closed to open
+                            is_closed = ear_value <= EAR_BLINK_THRESHOLD
+                            
+                            # If was closed and now open, increment blink count
+                            if blink_state['was_closed'] and not is_closed:
+                                blink_state['blink_count'] += 1
+                                print(f"Blink detected! Total blinks: {blink_state['blink_count']} (EAR: {ear_value:.3f})")
+                            
+                            # Update state for next frame
+                            blink_state['was_closed'] = is_closed
+                    
+                    # Log face detection and EAR results (every 10 frames to see results more frequently)
                     if frame_stats['total_received'] % 10 == 0:
                         status = "Face detected" if face_detected else "No face detected"
-                        print(f"Frame {frame_id}: {status} (total received: {frame_stats['total_received']})")
+                        ear_str = f", EAR: {ear_value:.3f}" if ear_value is not None else ""
+                        
+                        # Add info about which detection method was used
+                        detection_method = ""
+                        if landmarks:
+                            if landmarks.get('eyes_detected', False):
+                                detection_method = " [dlib landmarks]"
+                            else:
+                                detection_method = " [estimated positions]"
+                        
+                        # Log individual eye EAR values for debugging
+                        if landmarks and ear_value is not None:
+                            left_ear = EARCalculator.calculate_ear(landmarks.get('left_eye'))
+                            right_ear = EARCalculator.calculate_ear(landmarks.get('right_eye'))
+                            if left_ear is not None and right_ear is not None:
+                                ear_str += f" (L:{left_ear:.3f}, R:{right_ear:.3f})"
+                        
+                        print(f"Frame {frame_id}: {status}{ear_str}{detection_method} (total received: {frame_stats['total_received']})")
                     
                     # Also log first few frames for debugging
                     if frame_stats['total_received'] <= 5:
                         status = "Face detected" if face_detected else "No face detected"
                         print(f"Frame {frame_id}: {status} (frame #{frame_stats['total_received']})")
                         if landmarks:
-                            print(f"  - Left eye points: {len(landmarks.get('left_eye', []))} points")
-                            print(f"  - Right eye points: {len(landmarks.get('right_eye', []))} points")
+                            left_eye = landmarks.get('left_eye')
+                            right_eye = landmarks.get('right_eye')
+                            eyes_detected = landmarks.get('eyes_detected', False)
+                            print(f"  - Eyes actually detected: {eyes_detected}")
+                            print(f"  - Left eye points: {len(left_eye) if left_eye is not None else 0} points")
+                            print(f"  - Right eye points: {len(right_eye) if right_eye is not None else 0} points")
+                            if ear_value is not None:
+                                print(f"  - EAR value: {ear_value:.3f}")
+                                if not eyes_detected:
+                                    print(f"  - WARNING: Using estimated eye positions (actual eyes not detected)")
+                                    print(f"  - Estimated positions won't change when blinking - need actual eye detection")
                 except Exception as e:
                     print(f"Error during face detection for frame {frame_id}: {e}")
                     face_detected = False
+                    ear_value = None
                     import traceback
                     traceback.print_exc()
                 
@@ -252,14 +478,15 @@ class FrameHandler(http.server.SimpleHTTPRequestHandler):
                 
                 frame_stats['total_processed'] += 1
                 
-                # Send response with landmark detection result
+                # Send response with landmark detection and EAR result
                 response = {
                     'status': 'success',
                     'message': f'Frame {frame_id} received',
                     'frame_id': frame_id,
                     'saved': save_frame,
                     'filepath': str(filepath) if filepath else None,
-                    'face_detected': face_detected
+                    'face_detected': face_detected,
+                    'ear_value': ear_value
                 }
             else:
                 response = {
@@ -311,15 +538,13 @@ class FrameHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
     
+    
     def log_message(self, format, *args):
-        """Custom log format - log all requests for debugging"""
-        # Log all POST requests and errors
+        """Custom log format - minimal logging to avoid spam"""
+        # Only log errors, suppress normal POST/GET request logs
         message = format % args
-        if 'POST' in message or 'error' in message.lower():
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Frames: {frame_stats['total_received']} | {message}")
-        # Log every 100th GET request to avoid spam
-        elif 'GET' in message and frame_stats['total_received'] % 100 == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Frames: {frame_stats['total_received']} | {message}")
+        if 'error' in message.lower():
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {message}")
 
 def run_server():
     """Start the server optimized for camera stream"""

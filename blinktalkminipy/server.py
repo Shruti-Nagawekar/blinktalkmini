@@ -159,7 +159,10 @@ class FaceLandmarkDetector:
             # This combines OpenCV's reliable face detection with dlib's accurate landmarks
             if face_detector is not None and landmark_predictor is not None:
                 # Detect faces using OpenCV (more reliable)
-                faces = face_detector.detectMultiScale(gray, 1.1, 4, minSize=(50, 50))
+                # Using low-light optimized parameters as default for better detection in various lighting
+                # Lower scaleFactor (1.05), lower minNeighbors (3), smaller minSize (30, 30)
+                # These are more tolerant of low-light and lower contrast conditions
+                faces = face_detector.detectMultiScale(gray, 1.05, 3, minSize=(30, 30))
                 
                 if len(faces) == 0:
                     # Log occasionally to debug
@@ -237,7 +240,10 @@ class FaceLandmarkDetector:
                     FaceLandmarkDetector._last_log_frame = frame_stats.get('total_received', 0) + 50
                     print(f"FaceLandmarkDetector: Using OpenCV fallback (dlib not available)")
             
-            faces = face_detector.detectMultiScale(gray, 1.1, 4, minSize=(50, 50))
+            # Using low-light optimized parameters as default for better detection in various lighting
+            # Lower scaleFactor (1.05), lower minNeighbors (3), smaller minSize (30, 30)
+            # These are more tolerant of low-light and lower contrast conditions
+            faces = face_detector.detectMultiScale(gray, 1.05, 3, minSize=(30, 30))
             
             if len(faces) == 0:
                 # Log occasionally to debug

@@ -41,9 +41,12 @@ blink_state = {
 }
 
 # EAR threshold for blink detection
-# Based on observed values: closed ~0.33, open ~0.46
-# Using 0.35 as threshold (adjust if needed)
-EAR_BLINK_THRESHOLD = 0.35
+# TUNE THIS VALUE: Adjust based on testing
+# - Lower value (e.g., 0.30): More sensitive, may detect partial blinks
+# - Higher value (e.g., 0.40): Less sensitive, only full blinks
+# Based on observed values: closed ≤0.350, open >0.350
+# Current threshold: 0.350 (EAR ≤ 0.350 = closed, EAR > 0.350 = open)
+EAR_BLINK_THRESHOLD = 0.350
 
 # Optional: Keep last N frames in memory for processing
 frame_buffer = deque(maxlen=10)
@@ -374,6 +377,8 @@ class FrameHandler(http.server.SimpleHTTPRequestHandler):
             blink_state['blink_count'] = 0
             blink_state['was_closed'] = False
             blink_state['session_start_time'] = datetime.now()
+            blink_state['_transition_count'] = 0  # Reset tuning counter
+            blink_state['_first_frame'] = True  # Flag to log initial state
             
             response = {
                 'status': 'success',
@@ -387,6 +392,7 @@ class FrameHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(response).encode('utf-8'))
             print(f"Session started at {blink_state['session_start_time'].isoformat()}")
+            print(f"[TUNING] EAR threshold: {EAR_BLINK_THRESHOLD} (adjust in server.py if needed)")
             return
             
         elif self.path == '/end_session':
@@ -399,6 +405,7 @@ class FrameHandler(http.server.SimpleHTTPRequestHandler):
             total_blinks = blink_state['blink_count']
             blink_state['session_active'] = False
             blink_state['was_closed'] = False
+            blink_state['_transition_count'] = 0  # Reset tuning counter
             
             response = {
                 'status': 'success',
@@ -467,10 +474,24 @@ class FrameHandler(http.server.SimpleHTTPRequestHandler):
                             # Blink detection: count when EAR transitions from closed to open
                             is_closed = ear_value <= EAR_BLINK_THRESHOLD
                             
+                            # Log initial state on first frame of session
+                            if blink_state.get('_first_frame', True):
+                                state_str = "CLOSED" if is_closed else "OPEN"
+                                print(f"[TUNING] Initial state: {state_str} (EAR: {ear_value:.3f}, threshold: {EAR_BLINK_THRESHOLD})")
+                                blink_state['_first_frame'] = False
+                            
+                            # Log all state transitions for debugging
+                            if blink_state['was_closed'] != is_closed:
+                                # Show clear transition: previous state → current state
+                                prev_state = "CLOSED" if blink_state['was_closed'] else "OPEN"
+                                curr_state = "CLOSED" if is_closed else "OPEN"
+                                print(f"[TUNING] State transition: {prev_state} → {curr_state} (EAR: {ear_value:.3f}, threshold: {EAR_BLINK_THRESHOLD})")
+                                blink_state['_transition_count'] = blink_state.get('_transition_count', 0) + 1
+                            
                             # If was closed and now open, increment blink count
                             if blink_state['was_closed'] and not is_closed:
                                 blink_state['blink_count'] += 1
-                                print(f"Blink detected! Total blinks: {blink_state['blink_count']} (EAR: {ear_value:.3f})")
+                                print(f"Blink detected! Total blinks: {blink_state['blink_count']} (EAR: {ear_value:.3f}, threshold: {EAR_BLINK_THRESHOLD})")
                             
                             # Update state for next frame
                             blink_state['was_closed'] = is_closed
